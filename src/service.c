@@ -60,10 +60,24 @@ void* connection_loop(void* data)
     return 0;
 }
 
+static bool service_is_video_stable(service_t* service)
+{
+    if (service->video_stable)
+        return true;
+    if (service->video_valid_since_us == 0)
+        return false;
+    if (getticks_us() - service->video_valid_since_us >= VIDEO_STABLE_DEBOUNCE_US) {
+        INFO("service: video debounce elapsed, resuming frame sends");
+        service->video_stable = true;
+        return true;
+    }
+    return false;
+}
+
 int service_feed_frame(void* data, int width, int height, uint8_t* rgb_data)
 {
     service_t* service = (service_t*)data;
-    if (!service->video_stable)
+    if (!service_is_video_stable(service))
         return 0;
 
     int ret;
@@ -77,7 +91,7 @@ int service_feed_frame(void* data, int width, int height, uint8_t* rgb_data)
 int service_feed_nv12_frame(void* data, int width, int height, uint8_t* y, uint8_t* uv, int stride_y, int stride_uv)
 {
     service_t* service = (service_t*)data;
-    if (!service->video_stable)
+    if (!service_is_video_stable(service))
         return 0;
 
     int ret;
@@ -93,6 +107,7 @@ int service_init(service_t* service, settings_t* settings)
     service->settings = settings;
     service->video_stable = true;
     service->video_invalid_since_us = 0;
+    service->video_valid_since_us = 0;
 
     unicapture_init(&service->unicapture);
     service->unicapture.vsync = settings->vsync;
@@ -422,15 +437,6 @@ static bool power_callback(LSHandle* sh __attribute__((unused)), LSMessage* msg,
     return true;
 }
 
-static void videooutput_set_signal_invalid(service_t* service)
-{
-    if (service->video_stable) {
-        INFO("videooutput_callback: video signal invalid/transitioning — pausing frame sends");
-        service->video_stable = false;
-        service->video_invalid_since_us = getticks_us();
-    }
-}
-
 static bool videooutput_callback(LSHandle* sh __attribute__((unused)), LSMessage* msg, void* data)
 {
     JSchemaInfo schema;
@@ -443,61 +449,56 @@ static bool videooutput_callback(LSHandle* sh __attribute__((unused)), LSMessage
     parsed = jdom_parse(j_cstr_to_buffer(LSMessageGetPayload(msg)), DOMOPT_NOOPT, &schema);
 
     if (jis_null(parsed)) {
-        videooutput_set_signal_invalid(service);
         j_release(&parsed);
         return false;
     }
 
     jvalue_ref video_ref = jobject_get(parsed, j_cstr_to_buffer("video"));
     if (jis_null(video_ref) || !jis_valid(video_ref)) {
-        videooutput_set_signal_invalid(service);
         j_release(&parsed);
         return false;
     }
     jvalue_ref video_0_ref = jarray_get(video_ref, 0);
     if (jis_null(video_0_ref) || !jis_valid(video_0_ref)) {
-        videooutput_set_signal_invalid(service);
         j_release(&parsed);
         return false;
     }
     jvalue_ref video_info_ref = jobject_get(video_0_ref, j_cstr_to_buffer("videoInfo"));
-    if (jis_null(video_info_ref) || !jis_valid(video_info_ref)) {
-        videooutput_set_signal_invalid(service);
-        j_release(&parsed);
-        return false;
-    }
 
-    // Check signal dimensions and rendering readiness
-    jvalue_ref width_ref = jobject_get(video_info_ref, j_cstr_to_buffer("width"));
-    jvalue_ref height_ref = jobject_get(video_info_ref, j_cstr_to_buffer("height"));
-    jvalue_ref ready_ref = jobject_get(video_info_ref, j_cstr_to_buffer("isRenderingReady"));
+    // Only gate on explicit 0x0 dimensions — the signature of an active HDMI
+    // transition. Missing/null videoInfo (streaming apps, non-HDMI inputs) is
+    // not a transition and must not block frame sends.
+    if (jis_valid(video_info_ref) && !jis_null(video_info_ref)) {
+        jvalue_ref width_ref = jobject_get(video_info_ref, j_cstr_to_buffer("width"));
+        jvalue_ref height_ref = jobject_get(video_info_ref, j_cstr_to_buffer("height"));
 
-    int32_t sig_width = 0, sig_height = 0;
-    bool is_ready = true;
+        int32_t sig_width = -1, sig_height = -1;
+        if (jis_valid(width_ref) && jis_number(width_ref))
+            jnumber_get_i32(width_ref, &sig_width);
+        if (jis_valid(height_ref) && jis_number(height_ref))
+            jnumber_get_i32(height_ref, &sig_height);
 
-    if (jis_valid(width_ref) && jis_number(width_ref))
-        jnumber_get_i32(width_ref, &sig_width);
-    if (jis_valid(height_ref) && jis_number(height_ref))
-        jnumber_get_i32(height_ref, &sig_height);
-    if (jis_valid(ready_ref) && jis_boolean(ready_ref))
-        jboolean_get(ready_ref, &is_ready);
-
-    if (sig_width == 0 || sig_height == 0 || !is_ready) {
-        videooutput_set_signal_invalid(service);
-        j_release(&parsed);
-        return false;
-    }
-
-    // Signal looks valid — apply debounce before marking stable
-    if (!service->video_stable) {
-        uint64_t elapsed = getticks_us() - service->video_invalid_since_us;
-        if (elapsed >= VIDEO_STABLE_DEBOUNCE_US) {
-            INFO("videooutput_callback: video signal stable (%dx%d) — resuming frame sends", sig_width, sig_height);
-            service->video_stable = true;
+        if (sig_width == 0 && sig_height == 0) {
+            if (service->video_stable) {
+                INFO("videooutput_callback: HDMI transition (0x0) — pausing frame sends");
+                service->video_stable = false;
+                service->video_invalid_since_us = getticks_us();
+                service->video_valid_since_us = 0;
+            }
+        } else if (sig_width > 0 && sig_height > 0) {
+            if (!service->video_stable && service->video_valid_since_us == 0) {
+                INFO("videooutput_callback: signal back (%dx%d), starting debounce", sig_width, sig_height);
+                service->video_valid_since_us = getticks_us();
+            }
         }
     }
 
     if (service->settings->no_hdr) {
+        j_release(&parsed);
+        return false;
+    }
+
+    if (!jis_valid(video_info_ref) || jis_null(video_info_ref)) {
         j_release(&parsed);
         return false;
     }

@@ -15,6 +15,7 @@ typedef struct {
 
     bool video_stable;
     uint64_t video_invalid_since_us;
+    uint64_t video_valid_since_us;
 
     capture_backend_t ui_backend;
     capture_backend_t video_backend;
