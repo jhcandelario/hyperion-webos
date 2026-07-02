@@ -13,7 +13,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define VIDEO_STABLE_DEBOUNCE_US 2500000ULL
+#define VIDEO_STABLE_DEBOUNCE_US 1500000ULL
+#define VIDEO_STABLE_RECOVERY_TIMEOUT_US 10000000ULL
 
 // This is a deprecated symbol present in meta-lg-webos-ndk but missing in
 // latest buildroot NDK. It is required for proper public service registration
@@ -64,13 +65,25 @@ static bool service_is_video_stable(service_t* service)
 {
     if (service->video_stable)
         return true;
-    if (service->video_valid_since_us == 0)
-        return false;
-    if (getticks_us() - service->video_valid_since_us >= VIDEO_STABLE_DEBOUNCE_US) {
+
+    uint64_t now = getticks_us();
+
+    // Debounce elapsed after signal came back
+    if (service->video_valid_since_us > 0 && now - service->video_valid_since_us >= VIDEO_STABLE_DEBOUNCE_US) {
         INFO("service: video debounce elapsed, resuming frame sends");
         service->video_stable = true;
         return true;
     }
+
+    // Safety: if gated for too long with no recovery callback, force resume
+    if (service->video_invalid_since_us > 0 && now - service->video_invalid_since_us >= VIDEO_STABLE_RECOVERY_TIMEOUT_US) {
+        WARN("service: video gated for >10s with no recovery — forcing stable");
+        service->video_stable = true;
+        service->video_valid_since_us = 0;
+        service->video_invalid_since_us = 0;
+        return true;
+    }
+
     return false;
 }
 
