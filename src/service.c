@@ -61,6 +61,19 @@ void* connection_loop(void* data)
     return 0;
 }
 
+static void service_set_hdr_range(service_t* service, DynamicRange range)
+{
+    uint64_t now = getticks_us();
+    if (range == service->last_hdr_range && now - service->last_hdr_set_us < 2000000ULL)
+        return;
+    service->last_hdr_range = range;
+    service->last_hdr_set_us = now;
+    int ret = set_hdr_state(service->settings->unix_socket ? "127.0.0.1" : service->settings->address, RPC_PORT, range);
+    if (ret != 0) {
+        ERR("service_set_hdr_range: set_hdr_state failed, ret: %d", ret);
+    }
+}
+
 static bool service_is_video_stable(service_t* service)
 {
     if (service->video_stable)
@@ -90,6 +103,8 @@ static bool service_is_video_stable(service_t* service)
 int service_feed_frame(void* data, int width, int height, uint8_t* rgb_data)
 {
     service_t* service = (service_t*)data;
+    if (width <= 0 || height <= 0)
+        return 0;
     if (!service_is_video_stable(service))
         return 0;
 
@@ -104,6 +119,8 @@ int service_feed_frame(void* data, int width, int height, uint8_t* rgb_data)
 int service_feed_nv12_frame(void* data, int width, int height, uint8_t* y, uint8_t* uv, int stride_y, int stride_uv)
 {
     service_t* service = (service_t*)data;
+    if (width <= 0 || height <= 0)
+        return 0;
     if (!service_is_video_stable(service))
         return 0;
 
@@ -121,6 +138,8 @@ int service_init(service_t* service, settings_t* settings)
     service->video_stable = true;
     service->video_invalid_since_us = 0;
     service->video_valid_since_us = 0;
+    service->last_hdr_range = SDR;
+    service->last_hdr_set_us = 0;
 
     unicapture_init(&service->unicapture);
     service->unicapture.vsync = settings->vsync;
@@ -526,11 +545,7 @@ static bool videooutput_callback(LSHandle* sh __attribute__((unused)), LSMessage
     const char* hdr_type_str = hdr_type_buf.m_str;
     INFO("videooutput_callback: hdrType: %s", hdr_type_str);
 
-    DynamicRange range = get_dynamic_range(hdr_type_str);
-    int ret = set_hdr_state(service->settings->unix_socket ? "127.0.0.1" : service->settings->address, RPC_PORT, range);
-    if (ret != 0) {
-        ERR("videooutput_callback: set_hdr_state failed, ret: %d", ret);
-    }
+    service_set_hdr_range(service, get_dynamic_range(hdr_type_str));
 
     jstring_free_buffer(hdr_type_buf);
     j_release(&parsed);
@@ -575,11 +590,7 @@ static bool picture_callback(LSHandle* sh __attribute__((unused)), LSMessage* ms
     const char* dynamic_range_str = dynamic_range_buf.m_str;
     INFO("picture_callback: dynamicRange: %s", dynamic_range_str);
 
-    DynamicRange range = get_dynamic_range(dynamic_range_str);
-    int ret = set_hdr_state(service->settings->unix_socket ? "127.0.0.1" : service->settings->address, RPC_PORT, range);
-    if (ret != 0) {
-        ERR("videooutput_callback: set_hdr_state failed, ret: %d", ret);
-    }
+    service_set_hdr_range(service, get_dynamic_range(dynamic_range_str));
 
     jstring_free_buffer(dynamic_range_buf);
     j_release(&parsed);
