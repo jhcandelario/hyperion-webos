@@ -53,11 +53,11 @@ int hyperion_read()
     int n = read(sockfd, headbuff, 4);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT)
-            return 0; // timeout — connection still alive, nothing to read
-        return -1;    // real error
+            return 0; // timeout, connection still alive
+        return -1; // real socket error
     }
     if (n == 0)
-        return -1; // EOF — server closed connection
+        return -1; // EOF, server closed connection
     uint32_t messageSize = ((headbuff[0] << 24) & 0xFF000000) | ((headbuff[1] << 16) & 0x00FF0000) | ((headbuff[2] << 8) & 0x0000FF00) | ((headbuff[3]) & 0x000000FF);
     if (messageSize >= sizeof(recvBuff))
         return -1;
