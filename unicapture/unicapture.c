@@ -115,6 +115,7 @@ void* unicapture_run(void* data)
 
     uint64_t last_video_start = 0;
     uint64_t last_ui_start = 0;
+    uint64_t last_no_frame_warn_us = 0;
 
     converter_t ui_converter;
     converter_t video_converter;
@@ -255,7 +256,11 @@ void* unicapture_run(void* data)
             converter_run(&final_converter, &video_frame_converted, &final_frame, target_format);
         } else {
             got_frame = false;
-            WARN("No valid frame to send...");
+            uint64_t now_warn = getticks_us();
+            if (now_warn - last_no_frame_warn_us >= 5000000ULL) {
+                WARN("No valid frame to send...");
+                last_no_frame_warn_us = now_warn;
+            }
         }
 
         uint64_t frame_processed = getticks_us();

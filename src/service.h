@@ -4,6 +4,7 @@
 #include "unicapture.h"
 #include <glib.h>
 #include <pthread.h>
+#include <stdint.h>
 
 #define SERVICE_NAME "org.webosbrew.piccap.service"
 
@@ -11,6 +12,9 @@ typedef struct {
     bool running;
     bool connected;
     bool power_paused;
+
+    bool video_stable;
+    uint64_t video_invalid_since_us;
 
     capture_backend_t ui_backend;
     capture_backend_t video_backend;

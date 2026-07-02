@@ -28,6 +28,8 @@ static const char* _origin = NULL;
 static bool _connected = false;
 unsigned char recvBuff[1024];
 
+static int _send_error_count = 0;
+
 int hyperion_client(const char* origin, const char* hostname, int port, bool unix_socket, int priority)
 {
     _origin = origin;
@@ -149,12 +151,28 @@ int _send_message(const void* buffer, size_t size)
         (uint8_t)(size & 0xFF)
     };
 
-    // write message
     int ret = 0;
     if (write(sockfd, header, 4) < 0)
         ret = -1;
-    if (write(sockfd, buffer, size) < 0)
+    if (ret == 0 && write(sockfd, buffer, size) < 0)
         ret = -1;
+
+    if (ret != 0) {
+        _send_error_count++;
+        if (_send_error_count == 1 || _send_error_count % 60 == 0) {
+            WARN("Frame sending failed (count=%d)", _send_error_count);
+        }
+        if (_send_error_count > 30) {
+            WARN("Too many send failures — marking disconnected");
+            _connected = false;
+            _registered = false;
+            close(sockfd);
+            sockfd = 0;
+        }
+    } else {
+        _send_error_count = 0;
+    }
+
     return ret;
 }
 

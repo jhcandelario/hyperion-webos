@@ -5,12 +5,15 @@
 #include "pthread.h"
 #include "settings.h"
 #include "unicapture.h"
+#include "utils.h"
 #include "version.h"
 #include <errno.h>
 #include <luna-service2/lunaservice.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#define VIDEO_STABLE_DEBOUNCE_US 2500000ULL
 
 // This is a deprecated symbol present in meta-lg-webos-ndk but missing in
 // latest buildroot NDK. It is required for proper public service registration
@@ -57,8 +60,12 @@ void* connection_loop(void* data)
     return 0;
 }
 
-int service_feed_frame(void* data __attribute__((unused)), int width, int height, uint8_t* rgb_data)
+int service_feed_frame(void* data, int width, int height, uint8_t* rgb_data)
 {
+    service_t* service = (service_t*)data;
+    if (!service->video_stable)
+        return 0;
+
     int ret;
     if ((ret = hyperion_set_image(rgb_data, width, height)) != 0) {
         WARN("Frame sending failed: %d", ret);
@@ -67,8 +74,12 @@ int service_feed_frame(void* data __attribute__((unused)), int width, int height
     return 0;
 }
 
-int service_feed_nv12_frame(void* data __attribute__((unused)), int width, int height, uint8_t* y, uint8_t* uv, int stride_y, int stride_uv)
+int service_feed_nv12_frame(void* data, int width, int height, uint8_t* y, uint8_t* uv, int stride_y, int stride_uv)
 {
+    service_t* service = (service_t*)data;
+    if (!service->video_stable)
+        return 0;
+
     int ret;
     if ((ret = hyperion_set_nv12_image(y, uv, width, height, stride_y, stride_uv)) != 0) {
         WARN("Frame sending failed: %d", ret);
@@ -80,6 +91,8 @@ int service_feed_nv12_frame(void* data __attribute__((unused)), int width, int h
 int service_init(service_t* service, settings_t* settings)
 {
     service->settings = settings;
+    service->video_stable = true;
+    service->video_invalid_since_us = 0;
 
     unicapture_init(&service->unicapture);
     service->unicapture.vsync = settings->vsync;
@@ -409,43 +422,86 @@ static bool power_callback(LSHandle* sh __attribute__((unused)), LSMessage* msg,
     return true;
 }
 
+static void videooutput_set_signal_invalid(service_t* service)
+{
+    if (service->video_stable) {
+        INFO("videooutput_callback: video signal invalid/transitioning — pausing frame sends");
+        service->video_stable = false;
+        service->video_invalid_since_us = getticks_us();
+    }
+}
+
 static bool videooutput_callback(LSHandle* sh __attribute__((unused)), LSMessage* msg, void* data)
 {
     JSchemaInfo schema;
     jvalue_ref parsed;
     service_t* service = (service_t*)data;
 
-    if (service->settings->no_hdr) {
-        return false;
-    }
-
     // INFO("Videooutput status callback message: %s", LSMessageGetPayload(msg));
 
     jschema_info_init(&schema, jschema_all(), NULL, NULL);
     parsed = jdom_parse(j_cstr_to_buffer(LSMessageGetPayload(msg)), DOMOPT_NOOPT, &schema);
 
-    // Parsing failed
     if (jis_null(parsed)) {
-        j_release(&parsed);
-        return false; // was true; why?
-    }
-
-    // Get to the information we want (hdrType)
-    jvalue_ref video_ref = jobject_get(parsed, j_cstr_to_buffer("video"));
-    if (jis_null(video_ref) || !jis_valid(video_ref)) {
+        videooutput_set_signal_invalid(service);
         j_release(&parsed);
         return false;
     }
-    jvalue_ref video_0_ref = jarray_get(video_ref, 0); // should always be index 0 = main screen ?!
+
+    jvalue_ref video_ref = jobject_get(parsed, j_cstr_to_buffer("video"));
+    if (jis_null(video_ref) || !jis_valid(video_ref)) {
+        videooutput_set_signal_invalid(service);
+        j_release(&parsed);
+        return false;
+    }
+    jvalue_ref video_0_ref = jarray_get(video_ref, 0);
     if (jis_null(video_0_ref) || !jis_valid(video_0_ref)) {
+        videooutput_set_signal_invalid(service);
         j_release(&parsed);
         return false;
     }
     jvalue_ref video_info_ref = jobject_get(video_0_ref, j_cstr_to_buffer("videoInfo"));
     if (jis_null(video_info_ref) || !jis_valid(video_info_ref)) {
+        videooutput_set_signal_invalid(service);
         j_release(&parsed);
         return false;
     }
+
+    // Check signal dimensions and rendering readiness
+    jvalue_ref width_ref = jobject_get(video_info_ref, j_cstr_to_buffer("width"));
+    jvalue_ref height_ref = jobject_get(video_info_ref, j_cstr_to_buffer("height"));
+    jvalue_ref ready_ref = jobject_get(video_info_ref, j_cstr_to_buffer("isRenderingReady"));
+
+    int32_t sig_width = 0, sig_height = 0;
+    bool is_ready = true;
+
+    if (jis_valid(width_ref) && jis_number(width_ref))
+        jnumber_get_i32(width_ref, &sig_width);
+    if (jis_valid(height_ref) && jis_number(height_ref))
+        jnumber_get_i32(height_ref, &sig_height);
+    if (jis_valid(ready_ref) && jis_boolean(ready_ref))
+        jboolean_get(ready_ref, &is_ready);
+
+    if (sig_width == 0 || sig_height == 0 || !is_ready) {
+        videooutput_set_signal_invalid(service);
+        j_release(&parsed);
+        return false;
+    }
+
+    // Signal looks valid — apply debounce before marking stable
+    if (!service->video_stable) {
+        uint64_t elapsed = getticks_us() - service->video_invalid_since_us;
+        if (elapsed >= VIDEO_STABLE_DEBOUNCE_US) {
+            INFO("videooutput_callback: video signal stable (%dx%d) — resuming frame sends", sig_width, sig_height);
+            service->video_stable = true;
+        }
+    }
+
+    if (service->settings->no_hdr) {
+        j_release(&parsed);
+        return false;
+    }
+
     jvalue_ref hdr_type_ref = jobject_get(video_info_ref, j_cstr_to_buffer("hdrType"));
     if (jis_null(hdr_type_ref) || !jis_valid(hdr_type_ref) || !jis_string(hdr_type_ref)) {
         j_release(&parsed);
